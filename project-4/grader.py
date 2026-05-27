@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
-"""Grader CLI for mini-Gradescope."""
+"""Grader CLI for mini-Gradescope.
+
+Roles
+-----
+--role ta          Default. Can grade and view submissions, but student identity
+                   is hidden on assignments marked anonymous_grading=True.
+--role instructor  Full access. Always sees real student identities. Only role
+                   that can create assignments or enable anonymous grading.
+"""
 import argparse
 import sys
-import json
 from datetime import datetime
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 from mini_gradescope.services import assignment_service, submission_service, grading_service
-from mini_gradescope.services.results_service import get_all_results, get_results_for_submission
+from mini_gradescope.services.results_service import (
+    get_all_results,
+    get_results_for_submission,
+    AccessDenied,
+    InsufficientRole,
+)
 from mini_gradescope.services.grading_service import SubmissionNotFound, AlreadyGraded
 
 
@@ -32,12 +44,19 @@ def _parse_scores(raw: list[str]) -> dict[str, float]:
 
 
 def cmd_create_assignment(args):
-    a = assignment_service.create_assignment(args.title, args.description, args.max_score)
+    if args.role != "instructor":
+        print("Error: only instructors can create assignments.")
+        sys.exit(1)
+    a = assignment_service.create_assignment(
+        args.title, args.description, args.max_score,
+        anonymous_grading=args.anonymous,
+    )
     print(f"Assignment created.")
-    print(f"  ID          : {a.id}")
-    print(f"  Title       : {a.title}")
-    print(f"  Description : {a.description}")
-    print(f"  Max score   : {a.max_score}")
+    print(f"  ID               : {a.id}")
+    print(f"  Title            : {a.title}")
+    print(f"  Description      : {a.description}")
+    print(f"  Max score        : {a.max_score}")
+    print(f"  Anonymous grading: {a.anonymous_grading}")
 
 
 def cmd_list_submissions(args):
@@ -45,25 +64,39 @@ def cmd_list_submissions(args):
     if not subs:
         print("No submissions found.")
         return
-    print(f"{'Submission ID':<38} {'Student':<20} {'Submitted':<20} Graded?")
-    print("-" * 90)
+
+    from mini_gradescope.anonymization import should_anonymize, anonymize_submission
+    from mini_gradescope.services import assignment_service as asgn_svc
+
+    print(f"{'Submission ID':<38} {'Student':<24} {'Submitted':<20} Graded?")
+    print("-" * 95)
     for s in subs:
+        asgn = asgn_svc.get_assignment(s["assignment_id"])
+        display = anonymize_submission(s, asgn) if should_anonymize(asgn, args.role) else s
         grade = grading_service.get_grade_for_submission(s["id"])
         graded = f"Yes ({grade['overall_grade']})" if grade else "No"
-        print(f"{s['id']:<38} {s['student_id']:<20} {_ts(s['submitted_at']):<20} {graded}")
+        print(f"{display['id']:<38} {display['student_id']:<24} {_ts(s['submitted_at']):<20} {graded}")
 
 
 def cmd_view_submission(args):
-    sub = submission_service.get_submission(args.submission_id)
-    if not sub:
-        print(f"Error: submission '{args.submission_id}' not found.")
+    try:
+        r = get_results_for_submission(args.submission_id, args.grader_id, args.role)
+    except KeyError as e:
+        print(f"Error: {e}")
         sys.exit(1)
-    asgn = assignment_service.get_assignment(sub["assignment_id"])
-    grade = grading_service.get_grade_for_submission(args.submission_id)
+    except AccessDenied as e:
+        print(f"Access denied: {e}")
+        sys.exit(1)
+
+    sub = r["submission"]
+    asgn = r["assignment"]
+    grade = r["grade"]
 
     print(f"Submission : {sub['id']}")
     print(f"Student    : {sub['student_id']}")
     print(f"Assignment : {asgn['title'] if asgn else sub['assignment_id']}")
+    if asgn and asgn.get("anonymous_grading") and args.role != "instructor":
+        print(f"             [anonymous grading enabled — identity hidden]")
     print(f"Submitted  : {_ts(sub['submitted_at'])}")
     print(f"\n--- Content ---\n{sub['content']}\n--- End ---")
 
@@ -113,7 +146,12 @@ def cmd_update_grade(args):
 
 
 def cmd_all_results(args):
-    results = get_all_results()
+    try:
+        results = get_all_results(role=args.role)
+    except InsufficientRole as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     if not results:
         print("No submissions found.")
         return
@@ -122,55 +160,71 @@ def cmd_all_results(args):
         asgn = r["assignment"]
         grade = r["grade"]
         title = asgn["title"] if asgn else sub["assignment_id"]
+        anon_flag = " [anon]" if (asgn and asgn.get("anonymous_grading")) else ""
         status = f"{grade['total_score']}/{asgn['max_score']} ({grade['overall_grade']})" if grade else "Ungraded"
-        print(f"[{title}] student={sub['student_id']}  sub={sub['id'][:8]}...  {status}")
+        print(f"[{title}{anon_flag}] student={sub['student_id']}  sub={sub['id'][:8]}...  {status}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="mini-Gradescope: Grader CLI")
+    # Shared role argument inherited by every subcommand
+    role_parent = argparse.ArgumentParser(add_help=False)
+    role_parent.add_argument(
+        "--role", choices=["ta", "instructor"], default="ta",
+        help="Your role (default: ta). Instructors have full access; "
+             "TAs see anonymized data on blind-graded assignments.",
+    )
+
+    parser = argparse.ArgumentParser(description="mini-Gradescope: Grader/Instructor CLI")
     cmds = parser.add_subparsers(dest="command", required=True)
 
-    # create-assignment
-    p_ca = cmds.add_parser("create-assignment", help="Create a new assignment")
-    p_ca.add_argument("title", help="Assignment title")
-    p_ca.add_argument("description", help="Assignment description")
-    p_ca.add_argument("max_score", type=float, help="Maximum possible score")
+    # create-assignment  [instructor only]
+    p_ca = cmds.add_parser("create-assignment", parents=[role_parent],
+                            help="Create a new assignment (instructor only)")
+    p_ca.add_argument("title")
+    p_ca.add_argument("description")
+    p_ca.add_argument("max_score", type=float)
+    p_ca.add_argument("--anonymous", action="store_true",
+                      help="Enable anonymous grading for this assignment")
 
     # list-submissions
-    p_ls = cmds.add_parser("list-submissions", help="List submissions")
-    p_ls.add_argument("--assignment-id", help="Filter by assignment ID")
+    p_ls = cmds.add_parser("list-submissions", parents=[role_parent],
+                            help="List submissions (student identity hidden for TAs on anon assignments)")
+    p_ls.add_argument("--assignment-id", dest="assignment_id",
+                      help="Filter by assignment ID")
 
     # view-submission
-    p_vs = cmds.add_parser("view-submission", help="View a submission's content and grade")
-    p_vs.add_argument("submission_id", help="Submission ID")
+    p_vs = cmds.add_parser("view-submission", parents=[role_parent],
+                            help="View a submission's content and grade")
+    p_vs.add_argument("grader_id", help="Your grader/instructor ID")
+    p_vs.add_argument("submission_id")
 
     # grade
-    p_g = cmds.add_parser("grade", help="Grade a submission")
-    p_g.add_argument("grader_id", help="Your grader ID")
-    p_g.add_argument("submission_id", help="Submission ID to grade")
-    p_g.add_argument("--scores", nargs="+", required=True,
-                     metavar="ITEM=POINTS",
-                     help="Rubric scores e.g. --scores correctness=40 style=10")
-    p_g.add_argument("--feedback", required=True, help="Written feedback for the student")
+    p_g = cmds.add_parser("grade", parents=[role_parent], help="Grade a submission")
+    p_g.add_argument("grader_id")
+    p_g.add_argument("submission_id")
+    p_g.add_argument("--scores", nargs="+", required=True, metavar="ITEM=POINTS")
+    p_g.add_argument("--feedback", required=True)
 
     # update-grade
-    p_ug = cmds.add_parser("update-grade", help="Update an existing grade")
-    p_ug.add_argument("grader_id", help="Your grader ID")
-    p_ug.add_argument("submission_id", help="Submission ID to re-grade")
+    p_ug = cmds.add_parser("update-grade", parents=[role_parent],
+                            help="Update an existing grade")
+    p_ug.add_argument("grader_id")
+    p_ug.add_argument("submission_id")
     p_ug.add_argument("--scores", nargs="+", required=True, metavar="ITEM=POINTS")
-    p_ug.add_argument("--feedback", required=True, help="Updated feedback")
+    p_ug.add_argument("--feedback", required=True)
 
     # all-results
-    cmds.add_parser("all-results", help="View all submissions and their grades")
+    cmds.add_parser("all-results", parents=[role_parent],
+                    help="View all submissions and grades")
 
     args = parser.parse_args()
     {
         "create-assignment": cmd_create_assignment,
-        "list-submissions": cmd_list_submissions,
-        "view-submission": cmd_view_submission,
-        "grade": cmd_grade,
-        "update-grade": cmd_update_grade,
-        "all-results": cmd_all_results,
+        "list-submissions":  cmd_list_submissions,
+        "view-submission":   cmd_view_submission,
+        "grade":             cmd_grade,
+        "update-grade":      cmd_update_grade,
+        "all-results":       cmd_all_results,
     }[args.command](args)
 
 

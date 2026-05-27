@@ -2,6 +2,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 import time
 
+# Valid roles in the system and what they can do:
+#   student    – submit work, view own results only
+#   ta         – grade submissions, view all submissions/results
+#                (student identity hidden on anonymous assignments)
+#   instructor – full access: real identities always visible,
+#                can create assignments and toggle anonymous grading
+ROLES = ("student", "ta", "instructor")
+
 
 @dataclass
 class Assignment:
@@ -9,6 +17,7 @@ class Assignment:
     title: str
     description: str
     max_score: float
+    anonymous_grading: bool = False
     created_at: float = field(default_factory=time.time)
 
 
